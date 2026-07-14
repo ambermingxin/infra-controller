@@ -189,7 +189,7 @@ Each entry supports additional optional fields:
   ```
 
 - **`dpf_enabled`** (bool): Enable/disable DPF for this host.
-- **`dpu_mode`** (`"dpu_mode"` | `"nic_mode"` | `"no_dpu"`): Per-host DPU operating mode.
+- **`dpu_policy`** (`"manage"` | `"nic"` | `"ignore"`): Per-host policy for managing DPU hardware. `nic` and `ignore` override the site policy; for backward compatibility, `manage` or an omitted field inherits the site-wide policy, which defaults to `manage`. The previous `"use_as_nic"` policy value remains accepted, as do existing manifests using the `dpu_mode` key and `"dpu_mode"` | `"nic_mode"` | `"no_dpu"` values.
 - **`bmc_retain_credentials`** (bool): Skip BMC password rotation.
 - **`default_pause_ingestion_and_poweron`** (bool): Pause ingestion and power-on for this host.
 - **`bmc_ip_address`** (string): Static BMC IP (pre-allocates a machine interface).
