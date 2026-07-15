@@ -649,7 +649,7 @@ func TestManageOsImage_UpdateOperatingSystemsInDB(t *testing.T) {
 
 		tnOrg := "tenant-anomaly-org"
 		tnu := util.TestBuildUser(t, dbSession, uuid.NewString(), []string{tnOrg}, []string{"FORGE_TENANT_ADMIN"})
-		tn := util.TestBuildTenant(t, dbSession, "tenant-anomaly", tnOrg, nil, tnu)
+		tn := util.TestBuildTenant(t, dbSession, tnOrg, "tenant-anomaly", tnu)
 
 		osID := uuid.New()
 		_, err := osDAO.Create(ctx, nil, cdbm.OperatingSystemCreateInput{
