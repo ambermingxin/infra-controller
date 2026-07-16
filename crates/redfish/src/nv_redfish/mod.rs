@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -159,7 +160,8 @@ impl NvRedfishClientPool {
         connection_close: bool,
     ) -> Result<Arc<RedfishBmc>, Error> {
         let proxy_address = self.proxy_address.load();
-        let bmc_url = build_bmc_url(proxy_address.as_ref(), bmc_address);
+        let bmc_url = build_bmc_url(proxy_address.as_ref(), bmc_address)
+            .map_err(|e| Error::Bmc(BmcError::InvalidRequest(format!("invalid BMC URL: {e}"))))?;
 
         let mut headers = HeaderMap::new();
         if proxy_address.is_some() {
@@ -193,50 +195,31 @@ impl NvRedfishClientPool {
 
 /// Builds the BMC base URL, applying any configured proxy override.
 ///
-/// The `url` crate assembles the authority: `set_ip_host` brackets IPv6 literals
-/// for us, so an IPv6 BMC (or proxy host) yields a valid URL. A bare, unbracketed
-/// `2001:db8::1` authority would otherwise be rejected by the parser.
-fn build_bmc_url(proxy_address: &Option<HostPortPair>, bmc_address: SocketAddr) -> Url {
-    let mut url = Url::parse("https://placeholder.invalid").expect("static base URL is valid");
-    let port = match proxy_address {
-        None => {
-            set_ip_host(&mut url, bmc_address.ip());
-            bmc_address.port()
-        }
-        Some(HostPortPair::HostAndPort(h, p)) => {
-            set_host(&mut url, h);
-            *p
-        }
-        Some(HostPortPair::HostOnly(h)) => {
-            set_host(&mut url, h);
-            bmc_address.port()
-        }
-        Some(HostPortPair::PortOnly(p)) => {
-            set_ip_host(&mut url, bmc_address.ip());
-            *p
-        }
+/// Mirrors `health::BmcAddr::to_url()`: IPv6 hosts are bracketed so the URL
+/// authority parses — a bare `IpAddr` Display leaves IPv6 unbracketed
+/// (e.g. `2001:db8::1`), which `Url::parse` rejects.
+fn build_bmc_url(
+    proxy_address: &Option<HostPortPair>,
+    bmc_address: SocketAddr,
+) -> Result<Url, url::ParseError> {
+    // Bracket the BMC's own IP if IPv6; IPv4 renders unchanged.
+    let bmc_host = match bmc_address.ip() {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
     };
-    url.set_port(Some(port))
-        .expect("https base URL accepts a port");
-    url
-}
-
-/// Sets an IP host, letting the `url` crate bracket IPv6 literals.
-fn set_ip_host(url: &mut Url, ip: IpAddr) {
-    url.set_ip_host(ip)
-        .expect("https base URL accepts an IP host");
-}
-
-/// Sets a proxy host that may be a hostname or an IP literal. IP literals go
-/// through `set_ip_host` (which brackets IPv6); everything else through
-/// `set_host`.
-fn set_host(url: &mut Url, host: &str) {
-    match host.parse::<IpAddr>() {
-        Ok(ip) => set_ip_host(url, ip),
-        Err(_) => url
-            .set_host(Some(host))
-            .expect("proxy host is expected to be a valid URL host"),
-    }
+    let (host, port) = match proxy_address {
+        // No override: the BMC's own IP and port.
+        None => (bmc_host, bmc_address.port()),
+        // An operator-supplied override may replace the host, the port, or
+        // both; `url_host()` brackets an IPv6 literal proxy host.
+        Some(proxy) => (
+            proxy.url_host().map_or(bmc_host, Cow::into_owned),
+            proxy.port().unwrap_or_else(|| bmc_address.port()),
+        ),
+    };
+    let mut url = Url::parse(&format!("https://{host}"))?;
+    let _ = url.set_port(Some(port));
+    Ok(url)
 }
 
 #[cfg(test)]
@@ -260,7 +243,8 @@ mod tests {
         let url = build_bmc_url(
             &Some(HostPortPair::PortOnly(8443)),
             sock("[2001:db8::1]:443"),
-        );
+        )
+        .expect("url should build");
         assert_eq!(url.host_str(), Some("[2001:db8::1]"));
         assert_eq!(url.port(), Some(8443));
         assert_eq!(url.as_str(), "https://[2001:db8::1]:8443/");
@@ -269,7 +253,8 @@ mod tests {
     // IPv4 BMCs keep their unbracketed authority.
     #[test]
     fn port_only_proxy_leaves_ipv4_unchanged() {
-        let url = build_bmc_url(&Some(HostPortPair::PortOnly(8443)), sock("10.0.0.5:443"));
+        let url = build_bmc_url(&Some(HostPortPair::PortOnly(8443)), sock("10.0.0.5:443"))
+            .expect("url should build");
         assert_eq!(url.host_str(), Some("10.0.0.5"));
         assert_eq!(url.port(), Some(8443));
     }
@@ -279,7 +264,7 @@ mod tests {
     // explicit port (as it always did when the old string was parsed).
     #[test]
     fn no_proxy_brackets_ipv6_bmc() {
-        let url = build_bmc_url(&None, sock("[2001:db8::1]:443"));
+        let url = build_bmc_url(&None, sock("[2001:db8::1]:443")).expect("url should build");
         assert_eq!(url.host_str(), Some("[2001:db8::1]"));
         assert_eq!(url.port_or_known_default(), Some(443));
         assert_eq!(url.as_str(), "https://[2001:db8::1]/");
@@ -291,14 +276,16 @@ mod tests {
         let host_only = build_bmc_url(
             &Some(HostPortPair::HostOnly("2001:db8::2".to_string())),
             sock("10.0.0.5:443"),
-        );
+        )
+        .expect("url should build");
         assert_eq!(host_only.host_str(), Some("[2001:db8::2]"));
         assert_eq!(host_only.port_or_known_default(), Some(443));
 
         let host_and_port = build_bmc_url(
             &Some(HostPortPair::HostAndPort("2001:db8::2".to_string(), 8443)),
             sock("10.0.0.5:443"),
-        );
+        )
+        .expect("url should build");
         assert_eq!(host_and_port.host_str(), Some("[2001:db8::2]"));
         assert_eq!(host_and_port.port(), Some(8443));
     }
@@ -312,7 +299,8 @@ mod tests {
                 8443,
             )),
             sock("10.0.0.5:443"),
-        );
+        )
+        .expect("url should build");
         assert_eq!(url.host_str(), Some("bmc-proxy.example"));
         assert_eq!(url.port(), Some(8443));
     }
