@@ -158,6 +158,8 @@ navigation:
           path: operations/firmware-updates.md
         - page: Monitoring and Health
           path: operations/monitoring-health.md
+        - page: NVLink Domain Health Reports
+          path: operations/nvlink-domain-health-reports.md
         - page: Tenant Lifecycle Cleanup
           path: operations/tenant-lifecycle-cleanup.md
         - page: Network Isolation
