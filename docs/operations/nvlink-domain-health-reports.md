@@ -12,12 +12,10 @@ for the same source-keyed model applied to hosts.
 
 Management surfaces:
 
-- **API:** `ListNVLinkDomainHealthReports`, `InsertNVLinkDomainHealthReport`,
-  `RemoveNVLinkDomainHealthReport`.
 - **Admin CLI:** `nico-admin-cli nvl-domain health-report` (below).
 - **Admin web UI:** NVLink domain health pages, linked from machine detail.
 
-API and CLI RPC calls require the `Health` or `ForgeAdminCLI` RBAC permission
+CLI RPC calls require the `Health` or `ForgeAdminCLI` RBAC permission
 scope. Admin web UI access is controlled by its deployment authentication and
 network policy.
 
@@ -60,9 +58,7 @@ Removes the report submitted under `<REPORT_SOURCE>` from the domain.
 nico-admin-cli nvl-domain health-report print-empty-template
 ```
 
-Prints an empty health report template. Fill it in and submit it through
-`InsertNVLinkDomainHealthReport`. Insertion is an API operation with no CLI
-subcommand.
+Prints an empty health report template.
 
 ## Examples
 
