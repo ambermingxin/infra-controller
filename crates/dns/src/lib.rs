@@ -36,7 +36,7 @@ use hickory_server::proto::rr::Record;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
 use metrics_endpoint::{MetricsEndpointConfig, new_metrics_setup, run_metrics_endpoint};
-use opentelemetry::KeyValue;
+use opentelemetry::StringValue;
 use opentelemetry::metrics::{Counter, Meter, ObservableGauge};
 use rpc::forge_tls_client::{ApiConfig, ForgeClientT, ForgeTlsClient};
 use rpc::protos::dns::DnsResourceRecordLookupRequest;
@@ -51,8 +51,6 @@ use crate::config::Config;
 use crate::negative_cache::{CacheKey, NegativeCache};
 
 struct DnsMetrics {
-    negative_cache_hit: Counter<u64>,
-    negative_cache_miss: Counter<u64>,
     negative_cache_eviction: Counter<u64>,
     // Observable gauge of current cache occupancy: its callback reads the
     // cache length on each scrape. Held only to keep that callback registered
@@ -63,12 +61,6 @@ struct DnsMetrics {
 impl DnsMetrics {
     fn new(meter: &Meter, negative_cache: Arc<NegativeCache>) -> Self {
         Self {
-            negative_cache_hit: meter
-                .u64_counter("carbide_dns_negative_cache_hit_count")
-                .build(),
-            negative_cache_miss: meter
-                .u64_counter("carbide_dns_negative_cache_miss_count")
-                .build(),
             negative_cache_eviction: meter
                 .u64_counter("carbide_dns_negative_cache_eviction_count")
                 .build(),
@@ -221,6 +213,67 @@ impl From<ResponseCode> for Rcode {
     }
 }
 
+/// The response-code label on the negative-cache hit and miss counters.
+///
+/// This is a manual `LabelValue` implementation because the existing metric
+/// contract is Hickory's Debug rendering (`NXDomain`, `ServFail`, ...), not
+/// the snake_case rendering produced by the derive. Although `ResponseCode`
+/// can represent arbitrary unknown codes, these Events are only constructed
+/// from `classify_failure` results or cache entries populated from those same
+/// results, so the value domain is the five response codes selected there.
+#[derive(Debug, Clone, Copy)]
+struct NegativeCacheResponseCode(ResponseCode);
+
+impl LabelValue for NegativeCacheResponseCode {
+    fn label_value(&self) -> StringValue {
+        StringValue::from(match self.0 {
+            ResponseCode::FormErr => "FormErr",
+            ResponseCode::NXDomain => "NXDomain",
+            ResponseCode::ServFail => "ServFail",
+            ResponseCode::NotImp => "NotImp",
+            ResponseCode::Refused => "Refused",
+            code => return StringValue::from(format!("{code:?}")),
+        })
+    }
+}
+
+/// A query was answered from the negative cache. The Event keeps the
+/// historical Debug log and counter together as one occurrence.
+#[derive(Event)]
+#[event(
+    event_name = "dns_negative_cache_hit",
+    metric_name = "carbide_dns_negative_cache_hit_count_total",
+    component = "carbide-dns",
+    log = debug,
+    metric = counter,
+    message = "Negative cache hit",
+    describe = "Number of negative DNS cache hits, by response code"
+)]
+struct DnsNegativeCacheHit {
+    #[label]
+    response_code: NegativeCacheResponseCode,
+}
+
+/// An upstream negative response missed the cache. Its error remains log-only
+/// context while the bounded response code labels both the historical Warn log
+/// and counter.
+#[derive(Event)]
+#[event(
+    event_name = "dns_negative_cache_miss",
+    metric_name = "carbide_dns_negative_cache_miss_count_total",
+    component = "carbide-dns",
+    log = warn,
+    metric = counter,
+    message = "DNS lookup failed",
+    describe = "Number of negative DNS cache misses, by response code"
+)]
+struct DnsNegativeCacheMiss {
+    #[label]
+    response_code: NegativeCacheResponseCode,
+    #[context]
+    error: String,
+}
+
 /// A query arrived, counted by query type: the request rate is the signal, so
 /// no per-query log line is built.
 #[derive(Event)]
@@ -361,10 +414,9 @@ impl RequestHandler for DnsServer {
             let mut response_header = Metadata::response_from_request(request_info.metadata);
 
             let (response_code, records) = if let Some(code) = cached {
-                self.metrics
-                    .negative_cache_hit
-                    .add(1, &[KeyValue::new("response_code", format!("{code:?}"))]);
-                tracing::debug!("Negative cache hit");
+                emit(DnsNegativeCacheHit {
+                    response_code: NegativeCacheResponseCode(code),
+                });
                 (code, vec![])
             } else {
                 // Clone the client out under the lock, then release it so the
@@ -399,14 +451,14 @@ impl RequestHandler for DnsServer {
                         (ResponseCode::NoError, records)
                     }
                     Err(e) => {
-                        warn!(error = %e, "DNS lookup failed");
                         let NegativeClassification { code, transient } = classify_failure(e.code());
 
-                        // Count the upstream negative regardless of how it is cached
-                        // below.
-                        self.metrics
-                            .negative_cache_miss
-                            .add(1, &[KeyValue::new("response_code", format!("{code:?}"))]);
+                        // Count and log the upstream negative regardless of how
+                        // it is cached below.
+                        emit(DnsNegativeCacheMiss {
+                            response_code: NegativeCacheResponseCode(code),
+                            error: e.to_string(),
+                        });
 
                         // The LRU cache always admits the entry; a `true` return means
                         // a least-recently-used entry was evicted to make room.  Both are
@@ -752,6 +804,155 @@ mod tests {
                 ResponseCode::NXRRSet => Rcode::Other,
                 ResponseCode::Unknown(999) => Rcode::Other,
             }
+        );
+    }
+
+    #[test]
+    fn negative_cache_response_code_preserves_legacy_debug_rendering() {
+        use carbide_test_support::value_scenarios;
+
+        value_scenarios!(
+            run = |code: ResponseCode| NegativeCacheResponseCode(code).label_value().to_string();
+            "the classified negative response codes" {
+                ResponseCode::FormErr => "FormErr".to_string(),
+                ResponseCode::NXDomain => "NXDomain".to_string(),
+                ResponseCode::ServFail => "ServFail".to_string(),
+                ResponseCode::Refused => "Refused".to_string(),
+                ResponseCode::NotImp => "NotImp".to_string(),
+            }
+        );
+    }
+
+    /// Each negative-cache occurrence writes its historical log and advances
+    /// its existing counter from the same emit, with the response-code label
+    /// rendered identically on both sides.
+    #[test]
+    fn dns_negative_cache_events_pair_metrics_and_logs() {
+        use carbide_instrument::testing::{MetricsCapture, capture_logs};
+        use carbide_test_support::{Check, check_values};
+
+        enum NegativeCacheEvent {
+            Hit(ResponseCode),
+            Miss {
+                response_code: ResponseCode,
+                error: &'static str,
+            },
+        }
+
+        #[derive(Debug, PartialEq)]
+        struct LogObservation {
+            level: tracing::Level,
+            metadata_name: String,
+            message: String,
+            event_name: Option<String>,
+            metric_name: Option<String>,
+            response_code: Option<String>,
+            error: Option<String>,
+        }
+
+        #[derive(Debug, PartialEq)]
+        struct Observation {
+            log_count: usize,
+            log: Option<LogObservation>,
+            counters: [f64; 2],
+        }
+
+        fn expected_log(
+            level: tracing::Level,
+            metadata_name: &str,
+            message: &str,
+            metric_name: &str,
+            response_code: &str,
+            error: Option<&str>,
+        ) -> Option<LogObservation> {
+            Some(LogObservation {
+                level,
+                metadata_name: metadata_name.to_string(),
+                message: message.to_string(),
+                event_name: Some(metadata_name.to_string()),
+                metric_name: Some(metric_name.to_string()),
+                response_code: Some(response_code.to_string()),
+                error: error.map(str::to_string),
+            })
+        }
+
+        check_values(
+            [
+                Check {
+                    scenario: "negative-cache hit",
+                    input: NegativeCacheEvent::Hit(ResponseCode::NXDomain),
+                    expect: Observation {
+                        log_count: 1,
+                        log: expected_log(
+                            tracing::Level::DEBUG,
+                            "dns_negative_cache_hit",
+                            "Negative cache hit",
+                            "carbide_dns_negative_cache_hit_count_total",
+                            "NXDomain",
+                            None,
+                        ),
+                        counters: [1.0, 0.0],
+                    },
+                },
+                Check {
+                    scenario: "negative-cache miss",
+                    input: NegativeCacheEvent::Miss {
+                        response_code: ResponseCode::ServFail,
+                        error: "upstream unavailable",
+                    },
+                    expect: Observation {
+                        log_count: 1,
+                        log: expected_log(
+                            tracing::Level::WARN,
+                            "dns_negative_cache_miss",
+                            "DNS lookup failed",
+                            "carbide_dns_negative_cache_miss_count_total",
+                            "ServFail",
+                            Some("upstream unavailable"),
+                        ),
+                        counters: [0.0, 1.0],
+                    },
+                },
+            ],
+            |event| {
+                let metrics = MetricsCapture::start();
+                let logs = capture_logs(|| match event {
+                    NegativeCacheEvent::Hit(response_code) => emit(DnsNegativeCacheHit {
+                        response_code: NegativeCacheResponseCode(response_code),
+                    }),
+                    NegativeCacheEvent::Miss {
+                        response_code,
+                        error,
+                    } => emit(DnsNegativeCacheMiss {
+                        response_code: NegativeCacheResponseCode(response_code),
+                        error: error.to_string(),
+                    }),
+                });
+                let log = logs.first().map(|log| LogObservation {
+                    level: log.level,
+                    metadata_name: log.metadata_name.clone(),
+                    message: log.message.clone(),
+                    event_name: log.field("event_name").map(str::to_string),
+                    metric_name: log.field("metric_name").map(str::to_string),
+                    response_code: log.field("response_code").map(str::to_string),
+                    error: log.field("error").map(str::to_string),
+                });
+
+                Observation {
+                    log_count: logs.len(),
+                    log,
+                    counters: [
+                        metrics.counter_delta(
+                            "carbide_dns_negative_cache_hit_count_total",
+                            &[("response_code", "NXDomain")],
+                        ),
+                        metrics.counter_delta(
+                            "carbide_dns_negative_cache_miss_count_total",
+                            &[("response_code", "ServFail")],
+                        ),
+                    ],
+                }
+            },
         );
     }
 
