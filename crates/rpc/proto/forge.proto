@@ -2643,8 +2643,15 @@ message NetworkPrefix {
   reserved 5,6; // deprecated state and events
   // deprecated circuit id.
   reserved 7;
+  // Deprecated compatibility value capped at uint32's maximum value.
+  // Use free_ip_count_v2 for the widest representable count.
   uint32 free_ip_count = 8;
   optional string svi_ip = 9;
+  // Absent when free-IP accounting was not requested or when returned by an
+  // older server. Otherwise exact unless free_ip_count_saturated is true, in
+  // which case this is uint64's maximum value and the actual count is larger.
+  optional uint64 free_ip_count_v2 = 10;
+  bool free_ip_count_saturated = 11;
 }
 
 message MachineState {
