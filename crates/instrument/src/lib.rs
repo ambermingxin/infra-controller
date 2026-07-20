@@ -80,6 +80,23 @@
 //! }
 //! ```
 //!
+//! Context uses `Display` formatting by default. Use `#[context(value)]` for
+//! `bool`, `i64`, `f64`, or `String` fields whose native structured type must
+//! be retained:
+//!
+//! ```
+//! #[derive(carbide_instrument::Event)]
+//! #[event(
+//!     event_name = "retry_scheduled",
+//!     component = "demo",
+//!     message = "retry scheduled"
+//! )]
+//! struct RetryScheduled {
+//!     #[context(value)]
+//!     retry_interval_seconds: f64,
+//! }
+//! ```
+//!
 //! The metric name is validated at compile time -- the `carbide_` prefix, the
 //! `_total` suffix for counters, a unit suffix for histograms:
 //!
