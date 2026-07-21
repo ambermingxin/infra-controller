@@ -52,8 +52,8 @@ impl MqttStateChangeHook {
     ///
     /// Spawns a background task to process queued events.
     /// Emits metrics:
-    /// - `forge_dsx_event_bus_publish_count`: Number of MQTT publish attempts
-    /// - `forge_dsx_event_bus_queue_depth`: Current queue depth
+    /// - `carbide_dsx_event_bus_publish_count_total`: Number of MQTT publish attempts
+    /// - `carbide_dsx_event_bus_queue_depth`: Current queue depth
     pub fn new<P: MqttPublisher>(
         client: P,
         join_set: &mut JoinSet<()>,
@@ -96,24 +96,23 @@ impl StateChangeHook<MachineId, ManagedHostState> for MqttStateChangeHook {
                 let deadline = Instant::now() + self.publish_timeout;
                 let queued = QueuedMessage {
                     topic,
+                    machine_id: event.object_id.to_string(),
                     payload,
                     deadline,
                 };
-                if let Err(e) = self.sender.try_send(queued) {
-                    tracing::warn!(
-                        error = %e,
-                        "MQTT state change event dropped (queue full)",
-                    );
-                    self.metrics.record_overflow();
+                if let Err(error) = self.sender.try_send(queued) {
+                    let error_message = error.to_string();
+                    let queued = error.into_inner();
+                    self.metrics
+                        .record_overflow(queued.topic, queued.machine_id, error_message);
                 }
             }
-            Err(e) => {
-                tracing::error!(
-                    machine_id = %event.object_id,
-                    error = %e,
-                    "Failed to serialize state change message"
+            Err(error) => {
+                self.metrics.record_state_change_serialization_error(
+                    topic,
+                    event.object_id.to_string(),
+                    error.to_string(),
                 );
-                self.metrics.record_serialization_error();
             }
         }
     }

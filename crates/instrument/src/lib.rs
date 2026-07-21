@@ -80,6 +80,11 @@
 //! }
 //! ```
 //!
+//! A frozen metric label key that collides with a reserved Event-log field may
+//! use `#[label(name = "component")] publisher: Publisher`. The alias changes
+//! only the metric key; the generated log keeps the Rust field name
+//! (`publisher`). This compatibility form is intentionally label-only.
+//!
 //! The metric name is validated at compile time -- the `carbide_` prefix, the
 //! `_total` suffix for counters, a unit suffix for histograms:
 //!
