@@ -288,6 +288,10 @@ pub struct MachineATronConfig {
 
 impl MachineATronConfig {
     pub fn validate(&self) -> eyre::Result<()> {
+        if self.enable_ipmi_simulation {
+            bmc_mock::ipmi_sim::validate_executable()?;
+        }
+
         for (rack_id, rack) in &self.racks {
             eyre::ensure!(!rack_id.as_str().is_empty(), "rack ID cannot be empty");
             eyre::ensure!(
