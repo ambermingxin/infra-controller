@@ -1192,8 +1192,8 @@ mod tests {
 
     #[test]
     fn event_context_exposes_inventory_uuid_by_endpoint_type() {
-        let uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
-            .expect("valid inventory UUID");
+        let uuid =
+            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid inventory UUID");
 
         for (kind, expected) in [
             (ContextKind::Empty, (Some(uuid), None, None)),
