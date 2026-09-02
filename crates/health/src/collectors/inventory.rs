@@ -34,6 +34,44 @@ pub(crate) struct DerivedMetric {
     pub(crate) value: f64,
 }
 
+/// Identity of the GPU currently occupying a GPU chassis slot.
+///
+/// Resolved from the Redfish PCIe device beneath the chassis. The chassis id
+/// (`HGX_GPU_SXM_1`) names a socket on the baseboard and survives a GPU swap,
+/// so it cannot serve as the device identity; the UUID here can.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GpuIdentity {
+    pub(crate) uuid: Option<String>,
+    pub(crate) serial: Option<String>,
+    pub(crate) model: Option<String>,
+    /// Serial number of the enclosing GPU chassis, which on SXM baseboards is
+    /// the GPU module's own serial rather than the host chassis serial.
+    pub(crate) chassis_serial: Option<String>,
+}
+
+impl GpuIdentity {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.uuid.is_none() && self.serial.is_none() && self.model.is_none()
+    }
+
+    pub(crate) fn attributes(&self) -> Vec<MetricLabel> {
+        let mut attrs = Vec::new();
+        if let Some(uuid) = &self.uuid {
+            attrs.push((Cow::Borrowed("gpu_uuid"), uuid.clone()));
+        }
+        if let Some(serial) = &self.serial {
+            attrs.push((Cow::Borrowed("gpu_serial"), serial.clone()));
+        }
+        if let Some(model) = &self.model {
+            attrs.push((Cow::Borrowed("gpu_model"), model.clone()));
+        }
+        if let Some(chassis_serial) = &self.chassis_serial {
+            attrs.push((Cow::Borrowed("gpu_chassis_serial"), chassis_serial.clone()));
+        }
+        attrs
+    }
+}
+
 pub(crate) enum DiscoveredEntity<B: Bmc> {
     Processor {
         entity: Arc<Processor<B>>,
@@ -59,6 +97,9 @@ pub(crate) enum DiscoveredEntity<B: Bmc> {
     Chassis {
         entity: Arc<Chassis<B>>,
         sensors: Vec<SensorLink<B>>,
+        /// Populated only when `attributes.gpu_identity` is enabled and the
+        /// chassis has a PCIe device beneath it.
+        gpu: Option<GpuIdentity>,
     },
 }
 
@@ -163,13 +204,34 @@ impl<B: Bmc> DiscoveredEntity<B> {
                     attrs.push((Cow::Borrowed("model"), model));
                 }
             }
-            DiscoveredEntity::Chassis { entity, .. } => {
+            DiscoveredEntity::Chassis { entity, gpu, .. } => {
                 if let Some(model) = entity.raw().model.clone().flatten() {
                     attrs.push((Cow::Borrowed("model"), model));
+                }
+                if let Some(gpu) = gpu {
+                    attrs.extend(gpu.attributes());
                 }
             }
         }
         attrs
+    }
+
+    /// GPU identity for this entity, when it is a GPU-bearing chassis.
+    pub(crate) fn gpu_identity(&self) -> Option<&GpuIdentity> {
+        match self {
+            DiscoveredEntity::Chassis { gpu, .. } => gpu.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Redfish id of the chassis this entity represents, if any.
+    ///
+    /// Used to match an SSE `origin_of_condition` against discovered chassis.
+    pub(crate) fn chassis_id(&self) -> Option<String> {
+        match self {
+            DiscoveredEntity::Chassis { entity, .. } => Some(entity.raw().base.id.clone()),
+            _ => None,
+        }
     }
 
     pub(crate) fn key(&self) -> String {

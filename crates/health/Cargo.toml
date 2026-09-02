@@ -89,6 +89,7 @@ nv-redfish = { workspace = true, features = [
   "managers",
   "memory",
   "oem-nvidia",
+  "pcie-devices",
   "power-supplies",
   "processors",
   "sensors",

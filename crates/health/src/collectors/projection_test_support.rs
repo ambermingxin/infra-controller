@@ -874,10 +874,12 @@ impl ProjectionFixture {
             TestEntity::Chassis => DiscoveredEntity::Chassis {
                 entity: self.chassis("CH0"),
                 sensors: Vec::new(),
+                gpu: None,
             },
             TestEntity::SparseChassis => DiscoveredEntity::Chassis {
                 entity: self.chassis("CH-sparse"),
                 sensors: Vec::new(),
+                gpu: None,
             },
         }
     }

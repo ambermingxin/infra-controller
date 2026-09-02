@@ -70,6 +70,7 @@ pub(crate) struct BiancaBoard<'a> {
 struct GpuChassisIds {
     chassis_id: Cow<'static, str>,
     pcie_device_id: Cow<'static, str>,
+    index: usize,
 }
 
 impl BiancaBoard<'_> {
@@ -116,6 +117,7 @@ impl BiancaBoard<'_> {
             GpuChassisIds {
                 chassis_id: format!("HGX_GPU_{n}").into(),
                 pcie_device_id: format!("GPU_{n}").into(),
+                index: n,
             }
         })
     }
@@ -173,6 +175,12 @@ impl BiancaBoard<'_> {
                     .model("GB200 186GB HBM3e")
                     .part_number("2941-892-A1")
                     .serial_number(&self.gpu_serial_number)
+                    // Stable per-slot value so a test can assert that a given
+                    // slot reports a specific device identity.
+                    .uuid(&format!(
+                        "2b8c1f4a-6d33-4a11-9c02-7f5e0a1b{:04x}",
+                        ids.index
+                    ))
                     .build(),
                 ]),
                 id: ids.chassis_id,

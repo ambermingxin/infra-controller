@@ -51,6 +51,8 @@ pub struct Config {
 
     pub collectors: CollectorsConfig,
 
+    pub attributes: AttributesConfig,
+
     pub processors: ProcessorsConfig,
 
     pub metrics: MetricsConfig,
@@ -86,6 +88,7 @@ impl Default for Config {
             sinks: SinksConfig::default(),
             rate_limit: Configurable::Enabled(RateLimitConfig::default()),
             collectors: CollectorsConfig::default(),
+            attributes: AttributesConfig::default(),
             processors: ProcessorsConfig::default(),
             metrics: MetricsConfig::default(),
             shard: 0,
@@ -96,6 +99,27 @@ impl Default for Config {
             bmc_proxy_url: None,
         }
     }
+}
+
+/// Opt-in identity attributes attached to emitted telemetry.
+///
+/// These are attached as log record attributes and metric datapoint attributes
+/// rather than resource attributes: a single BMC endpoint fronts many GPUs, so
+/// per-GPU identity cannot be a property of the resource without changing how
+/// telemetry is grouped.
+///
+/// Defaults to disabled, since `gpu_identity` costs additional Redfish
+/// requests per discovery pass.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AttributesConfig {
+    /// Attach `gpu_uuid`, `gpu_serial`, `gpu_chassis_serial`, and `gpu_model`,
+    /// resolved from the Redfish PCIe device beneath each GPU chassis.
+    ///
+    /// On metrics these land on the sensor series that already exist for the
+    /// GPU chassis. On SSE log records they are resolved by matching
+    /// `origin_of_condition` against the discovered chassis.
+    pub gpu_identity: bool,
 }
 
 /// Configuration for where BMC endpoints are discovered from.

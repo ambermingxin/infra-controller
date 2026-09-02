@@ -21,6 +21,7 @@ use crate::redfish;
 use crate::redfish::account_service::AccountServiceState;
 use crate::redfish::chassis::ChassisState;
 use crate::redfish::computer_system::SystemState;
+use crate::redfish::event_service::EventServiceState;
 use crate::redfish::manager::ManagerState;
 use crate::redfish::session_service::SessionServiceState;
 use crate::redfish::update_service::UpdateServiceState;
@@ -37,6 +38,7 @@ pub struct BmcState {
     pub update_service_state: Arc<UpdateServiceState>,
     pub account_service_state: Arc<AccountServiceState>,
     pub(crate) session_service_state: Arc<SessionServiceState>,
+    pub event_service_state: Arc<EventServiceState>,
     pub injection: Arc<InjectionStore>,
     /// BMC self-reset simulation window (None = feature disabled; resets
     /// stay no-ops as before).

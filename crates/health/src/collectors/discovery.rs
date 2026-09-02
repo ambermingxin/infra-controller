@@ -21,11 +21,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::{StreamExt, stream};
-use nv_redfish::ServiceRoot;
 use nv_redfish::core::Bmc;
+use nv_redfish::{Resource, ServiceRoot};
 
 use crate::HealthError;
-use crate::collectors::inventory::{DiscoveredEntity, EntityInventory, SharedInventory};
+use crate::collectors::inventory::{
+    DiscoveredEntity, EntityInventory, GpuIdentity, SharedInventory,
+};
 use crate::collectors::runtime::{IterationResult, PeriodicCollector};
 use crate::endpoint::BmcEndpoint;
 
@@ -35,6 +37,11 @@ pub struct EntityDiscoveryCollectorConfig<B: Bmc> {
 
     /// Bounds local fan-out to the endpoint Redfish operation limit.
     pub request_concurrency: NonZeroUsize,
+
+    /// Resolve GPU identity from the PCIe device beneath each chassis.
+    ///
+    /// Costs one extra Redfish collection fetch per chassis, so it is opt-in.
+    pub gpu_identity: bool,
 }
 
 pub struct EntityDiscoveryCollector<B: Bmc> {
@@ -42,6 +49,7 @@ pub struct EntityDiscoveryCollector<B: Bmc> {
     bmc: Arc<B>,
     shared: SharedInventory<B>,
     request_concurrency: usize,
+    gpu_identity: bool,
     generation: u64,
 }
 
@@ -58,6 +66,7 @@ impl<B: Bmc + 'static> PeriodicCollector<B> for EntityDiscoveryCollector<B> {
             bmc,
             shared: config.shared,
             request_concurrency: config.request_concurrency.get(),
+            gpu_identity: config.gpu_identity,
             generation: 0,
         })
     }
@@ -363,13 +372,196 @@ impl<B: Bmc + 'static> EntityDiscoveryCollector<B> {
             .filter(|sensor| sensor_ids.insert(sensor.odata_id().to_string()))
             .collect();
 
-        if sensors.is_empty() {
+        let gpu = if self.gpu_identity {
+            self.resolve_gpu_identity(chassis, fetch_failures).await
+        } else {
+            None
+        };
+
+        // A sensorless chassis is normally not worth tracking, but one with a
+        // resolved GPU identity is still needed to attribute SSE log records.
+        if sensors.is_empty() && gpu.is_none() {
             return;
         }
 
         entities.push(DiscoveredEntity::Chassis {
             entity: chassis.clone(),
             sensors,
+            gpu,
         });
+    }
+
+    /// Resolve the identity of the device currently occupying a chassis slot.
+    ///
+    /// Returns `None` for chassis without PCIe devices, which is the common
+    /// case: only GPU and NVSwitch chassis carry them.
+    async fn resolve_gpu_identity(
+        &self,
+        chassis: &Arc<nv_redfish::chassis::Chassis<B>>,
+        fetch_failures: &AtomicUsize,
+    ) -> Option<GpuIdentity> {
+        let collection = self
+            .record_failure(
+                chassis.pcie_devices().await,
+                "get chassis pcie devices",
+                fetch_failures,
+            )
+            .flatten()?;
+
+        let devices = self.record_failure(
+            collection.members().await,
+            "get chassis pcie device members",
+            fetch_failures,
+        )?;
+
+        gpu_identity_from_chassis(chassis, &devices)
+    }
+}
+
+/// Read the identity of the GPU a chassis holds, from the chassis and its PCIe
+/// devices.
+pub(in crate::collectors) fn gpu_identity_from_chassis<B: Bmc>(
+    chassis: &nv_redfish::chassis::Chassis<B>,
+    devices: &[nv_redfish::pcie_device::PcieDevice<B>],
+) -> Option<GpuIdentity> {
+    gpu_identity_from_devices(devices).map(|mut identity| {
+        identity.chassis_serial = chassis.raw().serial_number.clone().flatten();
+        identity
+    })
+}
+
+/// Pick the GPU among a chassis' PCIe devices and read its identity.
+///
+/// A GPU chassis holds a single GPU device, but other chassis can hold several
+/// unrelated devices. An identity is only claimed when the device is
+/// unambiguous, otherwise the label would name an arbitrary device.
+pub(in crate::collectors) fn gpu_identity_from_devices<B: Bmc>(
+    devices: &[nv_redfish::pcie_device::PcieDevice<B>],
+) -> Option<GpuIdentity> {
+    let device = devices
+        .iter()
+        .find(|device| device.id().to_string().to_ascii_uppercase().contains("GPU"))
+        .or_else(|| devices.first().filter(|_| devices.len() == 1))?;
+
+    let raw = device.raw();
+    let identity = GpuIdentity {
+        uuid: raw.uuid.flatten().map(|uuid| uuid.to_string()),
+        serial: raw.serial_number.clone().flatten(),
+        model: raw.model.clone().flatten(),
+        // Filled in by the caller, which has the enclosing chassis.
+        chassis_serial: None,
+    };
+
+    (!identity.is_empty()).then_some(identity)
+}
+
+#[cfg(test)]
+mod bmc_mock_integration_tests {
+    use std::collections::BTreeMap;
+
+    use bmc_mock::test_support::{TestBmc, TestBmcHandle, nvidia_dgx_h100_bmc, wiwynn_gb200_bmc};
+    use nv_redfish::Resource as _;
+
+    use super::gpu_identity_from_chassis;
+    use crate::collectors::inventory::GpuIdentity;
+
+    /// Resolve a GPU identity for every chassis the mock BMC exposes, keyed by
+    /// chassis id. This is the same traversal the discovery collector performs,
+    /// minus the failure accounting.
+    async fn identities_by_chassis(h: &TestBmcHandle) -> BTreeMap<String, Option<GpuIdentity>> {
+        let chassis_list = h
+            .service_root
+            .chassis()
+            .await
+            .expect("chassis collection")
+            .expect("chassis collection is present");
+
+        let mut identities = BTreeMap::new();
+        for chassis in chassis_list.members().await.expect("chassis members") {
+            let identity = match chassis.pcie_devices().await.expect("pcie devices") {
+                Some(collection) => {
+                    let devices = collection.members().await.expect("pcie device members");
+                    gpu_identity_from_chassis::<TestBmc>(&chassis, &devices)
+                }
+                None => None,
+            };
+            identities.insert(chassis.id().to_string(), identity);
+        }
+        identities
+    }
+
+    #[tokio::test]
+    async fn dgx_h100_resolves_identity_for_every_gpu_chassis() {
+        let identities = identities_by_chassis(&nvidia_dgx_h100_bmc().await).await;
+
+        let gpu_chassis: Vec<_> = identities
+            .iter()
+            .filter(|(id, _)| id.starts_with("HGX_GPU_SXM_"))
+            .collect();
+        assert_eq!(gpu_chassis.len(), 8, "DGX H100 exposes 8 GPU chassis");
+
+        for (chassis_id, identity) in &gpu_chassis {
+            let identity = identity
+                .as_ref()
+                .unwrap_or_else(|| panic!("{chassis_id} must resolve a GPU identity"));
+            assert!(
+                identity.uuid.is_some(),
+                "{chassis_id} must carry a PCIe device UUID"
+            );
+            assert!(
+                identity.serial.is_some(),
+                "{chassis_id} must carry a GPU serial"
+            );
+            assert_eq!(
+                identity.model.as_deref(),
+                Some("H100 80GB HBM3"),
+                "{chassis_id} model"
+            );
+            assert!(
+                identity.chassis_serial.is_some(),
+                "{chassis_id} must carry the GPU module chassis serial"
+            );
+        }
+
+        // The UUID is what distinguishes one physical GPU from another, so a
+        // shared UUID across slots would make the label useless.
+        let uuids: std::collections::BTreeSet<_> = gpu_chassis
+            .iter()
+            .filter_map(|(_, identity)| identity.as_ref()?.uuid.clone())
+            .collect();
+        assert_eq!(uuids.len(), 8, "each GPU chassis reports a distinct UUID");
+    }
+
+    #[tokio::test]
+    async fn non_gpu_chassis_resolve_no_identity() {
+        let identities = identities_by_chassis(&nvidia_dgx_h100_bmc().await).await;
+
+        for (chassis_id, identity) in &identities {
+            if chassis_id.starts_with("HGX_GPU_SXM_") {
+                continue;
+            }
+            assert!(
+                identity.is_none(),
+                "{chassis_id} is not a GPU chassis but resolved {identity:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gb200_resolves_identity_for_every_gpu_chassis() {
+        let identities = identities_by_chassis(&wiwynn_gb200_bmc().await).await;
+
+        let resolved: Vec<_> = identities
+            .iter()
+            .filter_map(|(id, identity)| identity.as_ref().map(|i| (id, i)))
+            .collect();
+        assert_eq!(resolved.len(), 4, "Wiwynn GB200 exposes 4 GPU chassis");
+
+        for (chassis_id, identity) in resolved {
+            assert!(
+                identity.uuid.is_some(),
+                "{chassis_id} must carry a PCIe device UUID"
+            );
+        }
     }
 }

@@ -135,6 +135,7 @@ fn machine_router_inner(
         .add_routes(crate::redfish::telemetry_service::add_routes)
         .add_routes(crate::redfish::account_service::add_routes)
         .add_routes(crate::redfish::session_service::add_routes)
+        .add_routes(crate::redfish::event_service::add_routes)
         .add_routes(|routes| crate::redfish::computer_system::add_routes(routes, bmc_vendor))
         .add_routes(crate::redfish::virtual_media::add_routes)
         .add_routes(crate::ipmi::add_routes);
@@ -180,6 +181,7 @@ fn machine_router_inner(
         update_service_state,
         account_service_state,
         session_service_state,
+        event_service_state: Arc::new(crate::redfish::event_service::EventServiceState::new()),
         injection: injection.clone(),
         availability: availability.clone(),
         callbacks: Some(callbacks.clone()),

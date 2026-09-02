@@ -410,6 +410,9 @@ fn hgx_gpu_sxm_chassis(index: usize, serial: &str) -> redfish::chassis::SingleCh
             .model("H100 80GB HBM3")
             .part_number("2330-885-A1")
             .serial_number(serial)
+            // Stable per-slot value so a test can assert that a given slot
+            // reports a specific device identity.
+            .uuid(&format!("beea8cdf-7b7d-035c-ed07-360e311fcb{index:02x}"))
             .build(),
         ]),
         sensors: Some(redfish::sensor::generate_chassis_sensors(
